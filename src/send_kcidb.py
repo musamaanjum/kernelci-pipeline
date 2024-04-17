@@ -32,8 +32,7 @@ class KCIDBBridge(Service):
                 topic_name=args.kcidb_topic_name
             ),
             'sub_id': self._api_helper.subscribe_filters({
-                'kind': 'checkout',
-                'state': 'done',
+                'state': ('done', 'available'),
             }),
             'origin': args.origin,
         }
@@ -79,7 +78,7 @@ class KCIDBBridge(Service):
             'incomplete': False,
         }
         valid = result_map[result] if result else None
-        return {
+        return [{
             'id': f"{origin}:{checkout_node['id']}",
             'origin': origin,
             'tree_name': checkout_node['data']['kernel_revision']['tree'],
@@ -97,7 +96,99 @@ class KCIDBBridge(Service):
                 'submitted_by': 'kernelci-pipeline'
             },
             'valid': valid,
+        }]
+
+    def _parse_build_node(self, origin, node):
+        return [{
+            'id': f"{origin}:{node['id']}",
+            'checkout_id': f"{origin}:{node['parent']}",
+            'comment': node['data']['kernel_revision'].get('describe'),
+            'origin': origin,
+            'architecture': node['data'].get('arch'),
+            'compiler': node['data'].get('compiler'),
+            'config_name': node['data'].get('config_full'),
+            'start_time': self._set_timezone(node['created']),
+            'log_url': node.get('artifacts', {}).get('build_log'),
+            'valid': node['result'] == 'pass',
+        }]
+
+    def _parse_node_path(self, path, is_checkout_child):
+        """Parse and create KCIDB schema compatible node path
+        Convert node path list to dot-separated string and exclude
+        'checkout' and build node from the path to make test suite
+        the top level node
+        """
+        if isinstance(path, list):
+            if is_checkout_child:
+                # nodes with path such as ['checkout', 'kver']
+                path_str = '.'.join(path[1:])
+            else:
+                # nodes with path such as ['checkout', 'kbuild-gcc-10-x86', 'baseline-x86']
+                path_str = '.'.join(path[2:])
+            # Replace whitespace with "_" to match the allowed pattern for
+            # test `path` i.e '^[.a-zA-Z0-9_-]*$'
+            return path_str.replace(" ", "_")
+        return None
+
+    def _parse_node_result(self, test_node):
+        if test_node['result'] == 'incomplete':
+            if test_node['data'].get('error_code') in ('submit_error', 'invalid_job_params'):
+                return 'MISS'
+            return 'ERROR'
+        return test_node['result'].upper()
+
+    def _get_parent_build_node(self, node):
+        node = self._api.node.get(node['parent'])
+        if node['kind'] == 'kbuild' or node['kind'] == 'checkout':
+            return node
+        return self._get_parent_build_node(node)
+
+    def _create_dummy_build_node(self, origin, checkout_node, arch):
+        return {
+            'id': f"{origin}:dummy_{checkout_node['id']}_{arch}" if arch
+                  else f"{origin}:dummy_{checkout_node['id']}",
+            'checkout_id': f"{origin}:{checkout_node['id']}",
+            'comment': checkout_node['data']['kernel_revision'].get('describe'),
+            'origin': origin,
+            'start_time': self._set_timezone(checkout_node['created']),
+            'valid': True,
+            'architecture': arch,
         }
+
+    def _parse_test_node(self, origin, test_node):
+        dummy_build = {}
+        is_checkout_child = False
+        build_node = self._get_parent_build_node(test_node)
+        # Create dummy build node if test is hanging directly from checkout
+        if build_node['kind'] == 'checkout':
+            is_checkout_child = True
+            dummy_build = self._create_dummy_build_node(origin, build_node,
+                                                        test_node['data'].get('arch'))
+            build_id = dummy_build['id']
+        else:
+            build_id = f"{origin}:{build_node['id']}"
+
+        parsed_test_node = {
+            'id': f"{origin}:{test_node['id']}",
+            'origin': origin,
+            'build_id': build_id,
+            'comment': f"{test_node['name']} on {test_node['data'].get('platform')} \
+in {test_node['data'].get('runtime')}",
+            'start_time': self._set_timezone(test_node['created']),
+            'environment': {
+                'comment': f"Runtime: {test_node['data'].get('runtime')}",
+                'misc': {
+                    'platform': test_node['data'].get('platform'),
+                    'job_id': test_node['data'].get('job_id'),
+                    'job_context': test_node['data'].get('job_context'),
+                }
+            },
+            'waived': False,
+            'path': self._parse_node_path(test_node['path'], is_checkout_child),
+        }
+        if test_node['result']:
+            parsed_test_node['status'] = self._parse_node_result(test_node)
+        return parsed_test_node, dummy_build
 
     def _run(self, context):
         self.log.info("Listening for events... ")
@@ -107,12 +198,31 @@ class KCIDBBridge(Service):
             node = self._api_helper.receive_event_node(context['sub_id'])
             self.log.info(f"Submitting node to KCIDB: {node['id']}")
 
+            parsed_checkout_node = []
+            parsed_build_node = []
+            parsed_test_node = []
+
+            if node['kind'] == 'checkout':
+                parsed_checkout_node = self._parse_checkout_node(
+                    context['origin'], node)
+
+            elif node['kind'] == 'kbuild':
+                parsed_build_node = self._parse_build_node(
+                    context['origin'], node
+                )
+
+            elif node['kind'] == 'test':
+                test_node, build_node = self._parse_test_node(
+                    context['origin'], node
+                )
+                parsed_test_node.append(test_node)
+                if build_node:
+                    parsed_build_node.append(build_node)
+
             revision = {
-                'builds': [],
-                'checkouts': [
-                    self._parse_checkout_node(context['origin'], node)
-                ],
-                'tests': [],
+                'checkouts': parsed_checkout_node,
+                'builds': parsed_build_node,
+                'tests': parsed_test_node,
                 'version': {
                     'major': 4,
                     'minor': 3
