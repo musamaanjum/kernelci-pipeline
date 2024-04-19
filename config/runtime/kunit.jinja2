@@ -125,12 +125,14 @@ cd {src_path}
             'node': {
                 'result': step_results['exec'][0] or 'fail',
                 'artifacts': artifacts,
+                'data': {'arch': ARCH if ARCH else None}
             },
             'child_nodes': [
                 {
                     'node': {
                         'name': name,
                         'result': result,
+                        'data': {'arch': ARCH if ARCH else None}
                     },
                     'child_nodes': child_nodes,
                 } for name, (result, child_nodes) in step_results.items()
