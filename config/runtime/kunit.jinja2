@@ -144,6 +144,9 @@ cd {src_path}
         result = result.copy()
         result['node']['name'] = self._node['name']
         api_helper = kernelci.api.helper.APIHelper(self._api)
+        # Set architecture info
+        # Default arch is 'um' for kunit tests when no arch arg is supplied
+        self._node['data'].update({'arch': ARCH if ARCH else 'um'})
         api_helper.submit_results(result, self._node)
 
         return node
