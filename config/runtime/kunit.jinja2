@@ -95,6 +95,7 @@ cd {src_path}
             os.remove(job_log_path)
 
         arch_arg = f'--arch={ARCH}' if ARCH else ''
+        print("DEBUG: arch_arg:", self._node['id'], arch_arg)
         steps = {
             'config': f'config {arch_arg}',
             'build': f'build --jobs=$(nproc) {arch_arg}',
@@ -125,12 +126,14 @@ cd {src_path}
             'node': {
                 'result': step_results['exec'][0] or 'fail',
                 'artifacts': artifacts,
+                'data': {'arch': ARCH if ARCH else None}
             },
             'child_nodes': [
                 {
                     'node': {
                         'name': name,
                         'result': result,
+                        'data': {'arch': ARCH if ARCH else None}
                     },
                     'child_nodes': child_nodes,
                 } for name, (result, child_nodes) in step_results.items()
@@ -144,6 +147,8 @@ cd {src_path}
         result = result.copy()
         result['node']['name'] = self._node['name']
         api_helper = kernelci.api.helper.APIHelper(self._api)
+        print(f"DEBUG: arch for {self._node['id']}", ARCH)
+        print("DEBUG: submitting:", self._node['id'], result)
         api_helper.submit_results(result, self._node)
 
         return node
