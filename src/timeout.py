@@ -55,6 +55,19 @@ class TimeoutService(Service):
             })
         return nodes_count
 
+    def _count_running_build_child_nodes(self, checkout_id):
+        nodes_count = 0
+        build_nodes = self._api.node.find({
+            'parent': checkout_id,
+            'kind': 'kbuild'
+        })
+        for build in build_nodes:
+            for state in self._pending_states:
+                nodes_count += self._api.node.count({
+                    'parent': build['id'], 'state': state
+                })
+        return nodes_count
+
     def _get_child_nodes_recursive(self, node, recursive, state_filter=None):
         child_nodes = self._get_pending_nodes({'parent': node['id']})
         for child_id, child in child_nodes.items():
@@ -78,6 +91,7 @@ class TimeoutService(Service):
                     node_update['result'] = 'incomplete'
                     node_update['data']['error_code'] = 'node_timeout'
                     node_update['data']['error_msg'] = 'Node timed-out'
+                    self.log.debug(f"Incomplete node: {node_update}")
 
             if node['kind'] == 'checkout' and mode == 'DONE':
                 node_update['result'] = 'pass'
@@ -97,8 +111,11 @@ class Timeout(TimeoutService):
     def _check_pending_nodes(self, pending_nodes):
         timeout_nodes = {}
         for node_id, node in pending_nodes.items():
+            if node['kind'] == 'checkout':
+                self.log.debug(f"TIMEOUT: {node}")
             timeout_nodes[node_id] = node
             self._get_child_nodes_recursive(node, timeout_nodes)
+            self.log.debug(f"TIMEOUT mode: {timeout_nodes}")
         self._submit_lapsed_nodes(timeout_nodes, 'done', 'TIMEOUT')
 
     def _run(self, ctx):
@@ -137,8 +154,17 @@ class Holdoff(TimeoutService):
                 closing_nodes[node_id] = node
                 self._get_child_nodes_recursive(node, closing_nodes, 'available')
             else:
-                timeout_nodes[node_id] = node
-                self._get_child_nodes_recursive(node, timeout_nodes)
+                if node['kind'] == 'checkout':
+                    running = self._count_running_build_child_nodes(node_id)
+                    self.log.debug(f"{node_id} RUNNING build child nodes: {running}")
+                    if not running:
+                        timeout_nodes[node_id] = node
+                else:
+                    self.log.debug(f"DEBUG: node: {node_id}: {node['name']}")
+                    self.log.debug(f"DEBUG: timed-out child nodes \
+{self._get_child_nodes_recursive(node, timeout_nodes)}")
+                    timeout_nodes[node_id] = node
+                    self._get_child_nodes_recursive(node, timeout_nodes)
         self._submit_lapsed_nodes(closing_nodes, 'closing', 'HOLDOFF')
         self._submit_lapsed_nodes(timeout_nodes, 'done', 'DONE')
 
@@ -169,7 +195,13 @@ class Closing(TimeoutService):
             running = self._count_running_child_nodes(node_id)
             self.log.debug(f"{node_id} RUNNING: {running}")
             if not running:
-                done_nodes[node_id] = node
+                if node['kind'] == 'checkout':
+                    running = self._count_running_build_child_nodes(node['id'])
+                    self.log.debug(f"{node_id} RUNNING build child nodes: {running}")
+                    if not running:
+                        done_nodes[node_id] = node
+                else:
+                    done_nodes[node_id] = node
         self._submit_lapsed_nodes(done_nodes, 'done', 'DONE')
 
     def _run(self, ctx):
